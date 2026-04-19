@@ -1,0 +1,5 @@
+#include "primitives.revapp"
+((=self =w (=c =w
+   (self w c putc) (=r w r)
+   c eof equal) w getc) fix
+) main

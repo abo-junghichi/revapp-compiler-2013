@@ -1,0 +1,631 @@
+#ifndef COMPILE_C
+#define COMPILE_C
+#include <assert.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include "readtoken.c"
+#include "array.c"
+static bool sametoken(char_buf t, char_buf s)
+{
+    size_t i;
+    if (t.cur != s.cur)
+	return false;
+    for (i = 0; i < t.cur; i++) {
+	if (t.buf[i] != s.buf[i])
+	    return false;
+    }
+    return true;
+}
+typedef enum { opt_code, opt_closure, opt_unknown } opt_t;
+typedef struct {
+    opt_t type;
+    size_t id;
+} opt;
+typedef struct {
+    char_buf name;
+    opt cont;
+} name2opt;
+ARRAY(name2opt, env);
+static opt getopt(size_t envmask, env e, size_t id)
+{
+    opt rtn = e.buf[id].cont;
+    if (id < envmask && opt_closure == rtn.type) {
+	rtn.type = opt_unknown;
+	rtn.id = id;
+    }
+    return rtn;
+}
+static bool findopt(size_t envmask, env e, char_buf key, opt * rtn)
+{
+    size_t i = e.cur;
+    while (i > 0) {
+	name2opt cur;
+	i--;
+	cur = e.buf[i];
+	if (sametoken(cur.name, key)) {
+	    *rtn = getopt(envmask, e, i);
+	    return true;
+	}
+    }
+    return false;
+}
+ARRAY(opt, closure);
+ARRAY(closure, children);
+typedef struct {
+    size_t argc;
+    children ch;
+    size_t *refs /* nmemb = argc + ch.cur - 1 */ ;
+} combi;
+typedef struct {
+    char_buf stem;
+    bool iscombi;
+    combi inner /* if iscombi == false, inner isn't used. */ ;
+} code;
+ARRAY(code, codes);
+static void write_char_buf(FILE * out, char_buf str)
+{
+    fwrite(str.buf, 1, str.cur, out);
+}
+static bool goodname(char_buf str)
+{
+    size_t i;
+    bool table[128 /* ASCII charset */ ];
+    for (i = 0; i < 128; i++)
+	if (('A' <= i && i <= 'Z') || ('a' <= i && i <= 'z')
+	    || ('0' <= i && i <= '9') || '_' == i)
+	    table[i] = true;
+	else
+	    table[i] = false;
+    for (i = 0; i < str.cur; i++) {
+	unsigned char c = str.buf[i];
+	if (128 <= c || !table[c])
+	    return false;
+    }
+    return true;
+}
+static void writelabel(FILE * out, char_buf stem)
+{
+    fputs("docombi_", out);
+    write_char_buf(out, stem);
+}
+static void writecode_opt(FILE * out, codes co, opt tgt)
+{
+    switch (tgt.type) {
+    case opt_unknown:
+	fprintf(out, "arg[%zu]", tgt.id);
+	break;
+    case opt_closure:
+	fprintf(out, "child[%zu]", tgt.id);
+	break;
+    case opt_code:
+	writelabel(out, co.buf[tgt.id].stem);
+	break;
+    default:
+	assert(false);
+    }
+}
+static void writecode_closure(FILE * out, char *head, codes co,
+			      size_t nmemb, opt * tgts)
+{
+    size_t i;
+    for (i = 0; i < nmemb; i++) {
+	fprintf(out, "%s[%zu] = ", head, i);
+	writecode_opt(out, co, tgts[i]);
+	fputs(";\n", out);
+    }
+}
+static void writecode_livingcheck(bool * living, closure cl)
+{
+    size_t i;
+    for (i = 0; i < cl.cur; i++) {
+	opt op = cl.buf[i];
+	if (opt_code == op.type)
+	    living[op.id] = true;
+    }
+}
+static void writecode(FILE * out, codes co, closure top)
+{
+    size_t i, n, t;
+    bool *living = malloc(sizeof(bool) * co.cur);
+    for (i = 0; i < co.cur; i++)
+	living[i] = false;
+    writecode_livingcheck(living, top);
+    for (i = co.cur; i > 0;) {
+	children ch;
+	i--;
+	if (!(living[i] && co.buf[i].iscombi))
+	    continue;
+	ch = co.buf[i].inner.ch;
+	for (n = 0; n < ch.cur; n++)
+	    writecode_livingcheck(living, ch.buf[n]);
+    }
+    fputs("typedef enum { ", out);
+    for (i = 0, n = 0; i < co.cur; i++) {
+	if (!living[i])
+	    continue;
+	fprintf(out, "/* %zx */ ", n);
+	n++;
+	writelabel(out, co.buf[i].stem);
+	fputs(", ", out);
+    }
+    fputs("docombicombinum } docombilabel;\n"
+	  "static const size_t combinum = docombicombinum;\n"
+	  "static bool docombi"
+	  "(size_t * top, datastack * d, address_array * a,framestack * f)\n"
+	  "{\n" "\tsize_t i;\n" "\tdocombilabel label = *top;\n"
+	  "\tswitch (label) {\n", out);
+    for (i = 0; i < co.cur; i++) {
+	code cur = co.buf[i];
+	if (!living[i])
+	    continue;
+	fputs("\tcase ", out);
+	writelabel(out, cur.stem);
+	fputs(":\n", out);
+	if (cur.iscombi) {
+	    combi inner = cur.inner;
+	    children ch = inner.ch;
+	    closure body = ch.buf[ch.cur - 1];
+	    size_t unlinknum;
+	    if (0 < inner.argc) {
+		fprintf(out,
+			"\t\tif (d->used < d->base + %zu)\n"
+			"\t\t\treturn true;\n" "\t\telse {\n"
+			"\t\t\tsize_t head = d->used - %zu;\n", inner.argc,
+			inner.argc);
+	    } else
+		fputs("\t\t{\n" "\t\t\tsize_t head = d->used;\n", out);
+	    if (1 < ch.cur)
+		fprintf(out, "\t\t\tsize_t child[%zu];\n", ch.cur - 1);
+	    if (1 < body.cur)
+		fprintf(out, "\t\t\tsize_t back[%zu];\n", body.cur - 1);
+	    if (0 < inner.argc)
+		fprintf(out,
+			"\t\t\tsize_t arg[%zu];\n"
+			"\t\t\tfor (i = 0; i < %zu; i++)\n"
+			"\t\t\t\targ[i] = d->cont[head + i];\n",
+			inner.argc, inner.argc);
+	    {
+		unlinknum = 0;
+		for (n = 0; n < inner.argc; n++)
+		    if (1 > inner.refs[n])
+			unlinknum++;
+		if (unlinknum > 0) {
+		    fprintf(out,
+			    "\t\t\t{\n" "\t\t\t\tsize_t unlink[%zu];\n",
+			    unlinknum);
+		    for (n = 0, t = 0; n < inner.argc; n++)
+			if (1 > inner.refs[n]) {
+			    fprintf(out,
+				    "\t\t\t\tunlink[%zu] = arg[%zu];\n", t,
+				    n);
+			    t++;
+			}
+		    fprintf(out,
+			    "\t\t\t\trelease(d, a, %zu, unlink);\n"
+			    "\t\t\t}\n", unlinknum);
+		}
+	    }
+	    for (n = 0; n < inner.argc; n++)
+		if (1 < inner.refs[n])
+		    fprintf(out, "\t\t\tretain(a, arg[%zu], %zu);\n", n,
+			    inner.refs[n] - 1);
+	    for (n = 0; n < ch.cur - 1; n++) {
+		closure child = ch.buf[n];
+		fprintf(out, "\t\t\t{\n" "\t\t\t\tsize_t cont[%zu];\n",
+			child.cur);
+		writecode_closure(out, "\t\t\t\tcont", co, child.cur,
+				  child.buf);
+		fprintf(out,
+			"\t\t\t\tchild[%zu] = address_closure(a, %zu, %zu, cont);\n"
+			"\t\t\t}\n", n, inner.refs[inner.argc + n] - 1,
+			child.cur);
+	    }
+	    if (1 < body.cur)
+		writecode_closure(out, "\t\t\tback", co, body.cur - 1,
+				  body.buf);
+	    fputs("\t\t\t*top = ", out);
+	    writecode_opt(out, co, body.buf[body.cur - 1]);
+	    fputs(";\n", out);
+	    if (inner.argc + 1 < body.cur)
+		fprintf(out, "\t\t\tdataspace(d, head + %zu);\n",
+			body.cur - 1);
+	    else if (inner.argc + 1 > body.cur)
+		fprintf(out, "\t\t\td->used -= %zu;\n",
+			inner.argc + 1 - body.cur);
+	    if (1 < body.cur)
+		fprintf(out,
+			"\t\t\tfor (i = 0; i < %zu; i++)\n"
+			"\t\t\t\td->cont[head + i] = back[i];\n",
+			body.cur - 1);
+	    fputs("\t\t\treturn false;\n" "\t\t}\n", out);
+	} else {
+	    fputs("\t\treturn primitive_", out);
+	    write_char_buf(out, cur.stem);
+	    fputs("(top, d, a, f);\n", out);
+	}
+    }
+    fputs("\tdefault:\n" "\t\treturn true;\n" "\t}\n}\n", out);
+    if (1 > top.cur)
+	return;
+    fputs("static void run_revapp(datastack *d, address_array * a)\n" "{\n"
+	  "\tsize_t top = ", out);
+    writecode_opt(out, co, top.buf[top.cur - 1]);
+    fputs(", head, *back;\n", out);
+    if (1 < top.cur) {
+	fprintf(out,
+		"\thead = d->used;\n"
+		"\tback = dataspace(d, head + %zu) + head;\n",
+		top.cur - 1);
+	writecode_closure(out, "\tback", co, top.cur - 1, top.buf);
+    }
+    fputs("\ttop = interp(d, a, top);\n" "\thead = d->used;\n"
+	  "\tback = dataspace(d, head + 1) + head;\n" "\tback[0] = top;\n"
+	  "}\n", out);
+    free(living);
+}
+typedef struct {
+    size_t refn;
+    opt new;
+} combitrans;
+static opt mkcode_transopt(combitrans * envtable, combitrans * chtable,
+			   opt csrc)
+{
+    switch (csrc.type) {
+    case opt_unknown:
+	return envtable[csrc.id].new;
+    case opt_closure:
+	return chtable[csrc.id].new;
+    default:
+	assert(false);
+    case opt_code:
+	return csrc;
+    }
+}
+static void destruct_children(children * ch)
+{
+    size_t i;
+    for (i = 0; i < ch->cur; i++)
+	closure_free(&ch->buf[i]);
+    children_free(ch);
+}
+static void mkcode(char_buf bracketname, size_t envmask, env local,
+		   codes * co, children ch, closure * rtn)
+{
+    size_t i, n;
+    combitrans *envtable =
+	calloc(local.cur + ch.cur, sizeof(combitrans)), *chtable =
+	envtable + local.cur;
+    size_t eta, etamask;
+    combi tomake;
+    size_t bodylen;
+    assert(ch.cur > 0);
+    chtable[ch.cur - 1].refn = 1;
+    for (i = ch.cur; i > 0;) {
+	closure cl;
+	i--;
+	if (0 >= chtable[i].refn)
+	    continue;
+	cl = ch.buf[i];
+	for (n = 0; n < cl.cur; n++) {
+	    opt target = cl.buf[n];
+	    switch (target.type) {
+	    case opt_unknown:
+		envtable[target.id].refn++;
+		break;
+	    case opt_closure:
+		chtable[target.id].refn++;
+		break;
+	    default:
+		assert(false);
+	    case opt_code:
+		break;
+	    }
+	}
+    }
+    {
+	closure body = ch.buf[ch.cur - 1];
+	eta = 0;
+	for (etamask = local.cur; etamask > envmask; etamask--) {
+	    size_t peek = etamask - 1;
+	    opt arg, last;
+	    arg = local.buf[peek].cont;
+	    if (!(opt_unknown == arg.type && peek == arg.id))
+		continue;
+	    if (eta >= body.cur)
+		goto eta_end;
+	    last = body.buf[eta];
+	    if (!
+		(opt_unknown == last.type && peek == last.id
+		 && 1 == envtable[peek].refn)) {
+		goto eta_end;
+	    }
+	    envtable[peek].refn = 0;
+	    eta++;
+	}
+	for (; eta < body.cur; eta++) {
+	    opt last = body.buf[eta];
+	    if (!(opt_unknown == last.type || opt_code == last.type))
+		break;
+	    if (opt_unknown == last.type) {
+		if (1 != envtable[last.id].refn)
+		    break;
+		envtable[last.id].refn = 0;
+	    }
+	}
+      eta_end:
+	;
+    }
+    {
+	size_t argc = 0, chc = 0;
+	size_t *refs =
+	    malloc((etamask + ch.cur) * sizeof(size_t)), *chrefs;
+	children newch = children_init();
+	for (i = etamask; i > 0;) {
+	    opt src;
+	    i--;
+	    src = getopt(envmask, local, i);
+	    if (opt_unknown == src.type && i == src.id
+		&& (i >= envmask || 0 < envtable[i].refn)) {
+		opt dist;
+		dist.type = opt_unknown;
+		dist.id = argc;
+		envtable[i].new = dist;
+		refs[argc] = envtable[i].refn;
+		argc++;
+	    }
+	}
+	chrefs = refs + argc;
+	for (i = 0; i < ch.cur - 1; i++)
+	    if (0 < chtable[i].refn) {
+		opt dist;
+		closure newcl = closure_init(), oldcl = ch.buf[i];
+		dist.type = opt_closure;
+		dist.id = chc;
+		chtable[i].new = dist;
+		chrefs[chc] = chtable[i].refn;
+		for (n = 0; n < oldcl.cur; n++)
+		    closure_addlast(&newcl,
+				    mkcode_transopt(envtable, chtable,
+						    oldcl.buf[n]));
+		children_addlast(&newch, newcl);
+		chc++;
+	    }
+	{
+	    closure body = ch.buf[ch.cur - 1], newcl = closure_init();
+	    *rtn = closure_init();
+	    for (i = 0; i < eta; i++)
+		if (!
+		    (opt_unknown == body.buf[i].type
+		     && body.buf[i].id >= envmask))
+		    break;
+	    for (; i < eta; i++) {
+		opt toeta = body.buf[i];
+		assert(opt_code == toeta.type
+		       || (opt_unknown == toeta.type
+			   && toeta.id < envmask));
+		closure_addlast(rtn, toeta);
+	    }
+	    for (i = envmask; i > 0;) {
+		i--;
+		if (0 < envtable[i].refn) {
+		    opt add;
+		    add.type = opt_unknown;
+		    add.id = i;
+		    closure_addlast(rtn, add);
+		}
+	    }
+	    for (i = eta; i < body.cur; i++)
+		closure_addlast(&newcl,
+				mkcode_transopt(envtable, chtable,
+						body.buf[i]));
+	    children_addlast(&newch, newcl);
+	    bodylen = newcl.cur;
+	}
+	tomake.argc = argc;
+	tomake.ch = newch;
+	tomake.refs = realloc(refs, (argc + chc) * sizeof(size_t));
+    }
+    if (0 >= tomake.argc && 0 >= bodylen) {
+	free(tomake.refs);
+	destruct_children(&tomake.ch);
+	char_buf_free(&bracketname);
+    } else {
+	opt newcode;
+	code toadd;
+	if (0 >= bodylen) {
+	    opt ident;
+	    closure *body = &tomake.ch.buf[tomake.ch.cur - 1];
+	    ident.type = opt_code;
+	    ident.id = 0;
+	    closure_addlast(body, ident);
+	}
+	toadd.stem = bracketname;
+	toadd.iscombi = true;
+	toadd.inner = tomake;
+	newcode.type = opt_code;
+	newcode.id = co->cur;
+	codes_addlast(co, toadd);
+	closure_addlast(rtn, newcode);
+    }
+    free(envtable);
+}
+static void writenum(char_buf * rtn, size_t num)
+{
+    size_t mod = num % 10;
+    if (num >= 10)
+	writenum(rtn, num / 10);
+    char_buf_addlast(rtn, mod + '0');
+}
+static void compile_addplace(char_buf * rtn, source src)
+{
+    char_buf_addlast(rtn, 'l');
+    writenum(rtn, src.line + 1);
+    char_buf_addlast(rtn, 'c');
+    writenum(rtn, src.cha);
+    return;
+}
+static char_buf compile_placename(source src)
+{
+    char_buf rtn = char_buf_init();
+    compile_addplace(&rtn, src);
+    return rtn;
+}
+static char_buf compile_regionname(source head, source tail)
+{
+    char_buf rtn = compile_placename(head);
+    compile_addplace(&rtn, tail);
+    return rtn;
+}
+static bool compile_core(bool top, source * src, size_t envmask,
+			 env * local, env * global, codes * co,
+			 closure * rtn);
+static void compile_child(bool top, bool * badend, source * src,
+			  size_t envmask, env * local, env * global,
+			  codes * co, closure * body, children * ch)
+{
+    size_t i;
+    closure child;
+    opt toadd;
+    if (compile_core(top, src, local->cur, local, global, co, &child))
+	*badend = true;
+    for (i = 0; i < child.cur; i++) {
+	opt cur = child.buf[i];
+	if (opt_unknown == cur.type && envmask <= cur.id
+	    && opt_closure == local->buf[cur.id].cont.type)
+	    child.buf[i] = local->buf[cur.id].cont;
+    }
+    if (1 < child.cur) {
+	toadd.type = opt_closure;
+	toadd.id = ch->cur;
+	children_addlast(ch, child);
+    } else {
+	if (1 == child.cur)
+	    toadd = child.buf[0];
+	else {
+	    toadd.type = opt_code;
+	    toadd.id = 0;
+	}
+	closure_free(&child);
+    }
+    closure_addlast(body, toadd);
+    return;
+}
+static bool compile_core(bool top, source * src, size_t envmask,
+			 env * local, env * global, codes * co,
+			 closure * rtn)
+{
+    bool badend = false;
+    size_t i;
+    closure body = closure_init();
+    children ch = children_init();
+    source head = *src;
+    while (1) {
+	char_buf stem;
+	switch (readtoken(src, &stem)) {
+	case token_ref:
+	    {
+		opt toadd;
+		if (findopt(envmask, *local, stem, &toadd)
+		    || findopt(0, *global, stem, &toadd))
+		     char_buf_free(&stem);
+		else {
+		    name2opt gref;
+		    code gcode;
+		    if (!goodname(stem)) {
+			char_buf_free(&stem);
+			stem = compile_placename(*src);
+		    }
+		    gcode.stem = gref.name = stem;
+		    toadd.type = opt_code;
+		    toadd.id = co->cur;
+		    gref.cont = toadd;
+		    gcode.iscombi = false;
+		    env_addlast(global, gref);
+		    codes_addlast(co, gcode);
+		}
+		closure_addlast(&body, toadd);
+	    } continue;
+	case token_def:
+	    {
+		name2opt toadd;
+		size_t leave = body.cur;
+		toadd.name = stem;
+		if (0 < leave) {
+		    toadd.cont = body.buf[body.cur - 1];
+		    closure_resize(&body, body.cur - 1);
+		} else {
+		    toadd.cont.type = opt_unknown;
+		    toadd.cont.id = local->cur;
+		}
+		env_addlast(local, toadd);
+		if (1 == leave) {
+		    compile_child(top, &badend, src, envmask, local,
+				  global, co, &body, &ch);
+		    break;
+		}
+	    }
+	    continue;
+	case token_open:
+	    compile_child(false, &badend, src, envmask, local, global, co,
+			  &body, &ch);
+	    continue;
+	case token_close:
+	    if (top)
+		badend = true;
+	    break;
+	case token_eof:
+	default:
+	    if (false == top)
+		badend = true;
+	    break;
+	}
+	break;
+    }
+    children_addlast(&ch, body);
+    mkcode(compile_regionname(head, *src), envmask, *local, co, ch, rtn);
+    for (i = envmask; i < local->cur; i++)
+	char_buf_free(&local->buf[i].name);
+    env_resize(local, envmask);
+    destruct_children(&ch);
+    return badend;
+}
+static bool compile(source * src, FILE * out)
+{
+    size_t i;
+    env local = env_init(), global = env_init();
+    codes co = codes_init();
+    bool rtn;
+    closure top;
+    {
+	char *name = "nop";
+	code gcode;
+	char_buf stem = char_buf_init();
+	name2opt gref;
+	for (i = 0; name[i] != '\0'; i++)
+	    char_buf_addlast(&stem, name[i]);
+	gcode.stem = gref.name = stem;
+	gref.cont.type = opt_code;
+	gref.cont.id = 0;
+	env_addlast(&global, gref);
+	gcode.iscombi = false;
+	codes_addlast(&co, gcode);
+    }
+    rtn = compile_core(true, src, 0, &local, &global, &co, &top);
+    if (!rtn)
+	writecode(out, co, top);
+    closure_free(&top);
+    assert(NULL == local.buf);
+    env_free(&global);
+    for (i = 0; i < co.cur; i++) {
+	code cur = co.buf[i];
+	char_buf_free(&cur.stem);
+	if (cur.iscombi) {
+	    combi inner = cur.inner;
+	    free(inner.refs);
+	    destruct_children(&inner.ch);
+	}
+    }
+    codes_free(&co);
+    return rtn;
+}
+#endif				/* COMPILE_C */
